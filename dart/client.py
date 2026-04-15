@@ -4,7 +4,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 DART_API_BASE = "https://opendart.fss.or.kr/api"
 CORP_CODE_CACHE_TTL = 24 * 3600  # 24 hours
+
+
+class DartApiRateLimited(Exception):
+    """Raised when DART returns status 020 (daily quota exceeded)."""
+    pass
 
 
 class DartClient:
@@ -26,6 +31,42 @@ class DartClient:
         self._corp_cache: Optional[Dict[str, Tuple[str, str]]] = (
             None  # corp_name -> (corp_code, stock_code)
         )
+
+    def _get_json_with_retry(
+        self,
+        url: str,
+        params: dict,
+        max_retries: int = 3,
+        timeout: int = 30,
+    ) -> Optional[Dict[str, Any]]:
+        """HTTP GET with exponential backoff (1s, 2s, 4s) on transient errors.
+
+        Retries only on network/parse errors. Returns parsed JSON, or None if
+        all attempts failed. API-level errors (non-200 status codes from DART)
+        are returned as-is for the caller to inspect.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    url, params=params, timeout=timeout, verify=False
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.RequestException, ValueError) as e:
+                last_err = e
+                if attempt == max_retries - 1:
+                    break
+                sleep_s = 2 ** attempt
+                logger.warning(
+                    "DART API error (attempt %d/%d): %s; retrying in %ds",
+                    attempt + 1, max_retries, e, sleep_s,
+                )
+                time.sleep(sleep_s)
+        logger.error(
+            "DART API failed after %d attempts: %s", max_retries, last_err
+        )
+        return None
 
     def _corp_code_xml_path(self) -> str:
         return os.path.join(self.data_dir, "corp_codes.xml")
@@ -101,14 +142,8 @@ class DartClient:
             "page_count": str(page_count),
             "page_no": "1",
         }
-        try:
-            resp = requests.get(
-                url, params=params, timeout=30, verify=False
-            )  # verify=False for development
-            resp.raise_for_status()
-            data = resp.json()
-        except (requests.RequestException, ValueError) as e:
-            logger.error("DART API error for %s: %s", corp_code, e)
+        data = self._get_json_with_retry(url, params)
+        if data is None:
             return []
 
         if data.get("status") != "000":
@@ -122,3 +157,43 @@ class DartClient:
 
         items = data.get("list", [])
         return [Disclosure.from_api(item) for item in items]
+
+    def get_all_recent_disclosures(
+        self, bgn_de: str, page_count: int = 100, max_pages: int = 5
+    ) -> List[Disclosure]:
+        """Fetch ALL disclosures from DART since bgn_de (YYYYMMDD), paginating.
+
+        Uses one API call per page regardless of how many companies we're
+        watching. Raises DartApiRateLimited on daily quota exceeded (status 020)
+        so the caller can back off instead of hammering the quota wall.
+        """
+        url = f"{DART_API_BASE}/list.json"
+        results: List[Disclosure] = []
+        for page_no in range(1, max_pages + 1):
+            params = {
+                "crtfc_key": self.api_key,
+                "bgn_de": bgn_de,
+                "page_count": str(page_count),
+                "page_no": str(page_no),
+            }
+            data = self._get_json_with_retry(url, params)
+            if data is None:
+                logger.error("Giving up on page %d after retries", page_no)
+                break
+
+            status = data.get("status")
+            if status == "020":
+                raise DartApiRateLimited(data.get("message", "daily quota exceeded"))
+            if status == "013":
+                break  # no data
+            if status != "000":
+                logger.warning(
+                    "DART API status %s: %s", status, data.get("message")
+                )
+                break
+
+            items = data.get("list", [])
+            results.extend(Disclosure.from_api(it) for it in items)
+            if len(items) < page_count:
+                break  # last page
+        return results
